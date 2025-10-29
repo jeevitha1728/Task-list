@@ -1,0 +1,229 @@
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  const userEmail = Session.getActiveUser().getEmail();
+  const ownerEmail = SpreadsheetApp.getActiveSpreadsheet().getOwner().getEmail();
+
+  if (userEmail === ownerEmail) {
+    ui.createMenu("Task Alerts")
+      .addItem("Send Alerts", "sendEmailAlerts")
+      .addItem("Set Alert Time", "setAlertTime")
+      .addToUi();
+  }
+}
+
+function onEdit(e) {
+  const sheet = e.range.getSheet();
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  const colProject = headers.findIndex(h => h.toLowerCase().includes("project")) + 1;
+  const colSubtask = headers.findIndex(h => h.toLowerCase().includes("subtask")) + 1;
+  const colAssignedTo = headers.findIndex(h => h.toLowerCase().includes("assigned to")) + 1;
+  const colStatus = headers.findIndex(h => h.toLowerCase().includes("status")) + 1;
+  const colDeadline = headers.findIndex(h => h.toLowerCase().includes("deadline")) + 1;
+  const colCompletedAt = headers.findIndex(h => h.toLowerCase().includes("completed at")) + 1;
+  const colComments = headers.findIndex(h => h.toLowerCase().includes("comment")) + 1;
+  const colDeadlineStatus = headers.findIndex(h => h.toLowerCase().includes("deadline status")) + 1;
+
+  const row = e.range.getRow();
+  const col = e.range.getColumn();
+  if (row === 1) return; // Skip header row
+
+  // ✅ Assigned To dropdown from K2:K
+  const assignedList = sheet.getRange("K2:K").getValues().flat().filter(String);
+  const assignedRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(assignedList, true)
+    .setAllowInvalid(false)
+    .build();
+
+  // ✅ Status dropdown from I2:I
+  const statusList = sheet.getRange("I2:I").getValues().flat().filter(String);
+  const statusColors = {};
+  const statusData = sheet.getRange("I2:J").getValues();
+  statusData.forEach(r => {
+    if (r[0] && r[1]) statusColors[r[0].toLowerCase()] = r[1];
+  });
+
+  const statusRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(statusList, true)
+    .setAllowInvalid(false)
+    .build();
+
+  // Apply dropdowns only if subtask exists
+  const subtaskValue = sheet.getRange(row, colSubtask).getValue();
+  if (subtaskValue) {
+    sheet.getRange(row, colAssignedTo).setDataValidation(assignedRule);
+    sheet.getRange(row, colStatus).setDataValidation(statusRule);
+  }
+
+  // ✅ Deadline column as date+time with picker
+  if (col === colDeadline) {
+    const deadlineCell = sheet.getRange(row, colDeadline);
+    const dateRule = SpreadsheetApp.newDataValidation()
+      .requireDate()
+      .setAllowInvalid(false)
+      .build();
+    deadlineCell.setDataValidation(dateRule);
+    deadlineCell.setNumberFormat("dd-MM-yyyy HH:mm");
+  }
+
+  // ✅ When status changes
+  if (col === colStatus && e.value) {
+    const value = e.value.trim().toLowerCase();
+    const statusCell = sheet.getRange(row, colStatus);
+    statusCell.setBackground(statusColors[value] || "white");
+
+    const completedCell = sheet.getRange(row, colCompletedAt);
+    if (value === "completed") {
+      if (!completedCell.getValue()) {
+        completedCell.setValue(
+          Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd-MM-yyyy HH:mm:ss a")
+        );
+      }
+      // Lock completed row
+      const protection = sheet.getRange(row, 1, 1, sheet.getLastColumn()).protect();
+      protection.setDescription("Row locked because task is completed");
+      protection.removeEditors(protection.getEditors());
+      protection.addEditor(Session.getEffectiveUser());
+      // Clear note
+      sheet.getRange(row, colComments).clearNote();
+    } else {
+      completedCell.clearContent();
+      // Remove protections
+      sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+        .forEach(p => { if (p.getRange().getRow() === row) p.remove(); });
+      // Add note reminder
+      const commentCell = sheet.getRange(row, colComments);
+      if (!commentCell.getNote()) {
+        commentCell.setNote("⚠ Please add a comment explaining the delay.");
+      }
+    }
+  }
+
+  // ✅ Deadline status logic
+  if (col === colDeadline || col === colStatus) {
+    updateDeadlineStatus(sheet, row, colDeadline, colStatus, colDeadlineStatus);
+  }
+}
+
+function updateDeadlineStatus(sheet, row, colDeadline, colStatus, colDeadlineStatus) {
+  const deadlineCell = sheet.getRange(row, colDeadline);
+  const statusCell = sheet.getRange(row, colStatus);
+  const deadlineStatusCell = sheet.getRange(row, colDeadlineStatus);
+
+  const deadlineValue = deadlineCell.getValue();
+  const statusValue = statusCell.getValue() ? statusCell.getValue().toLowerCase() : "";
+
+  if (deadlineValue) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const deadlineDate = new Date(deadlineValue);
+    deadlineDate.setHours(0, 0, 0, 0);
+
+    if (statusValue === "completed") {
+      deadlineStatusCell.setValue("✅ Completed").setBackground("#93c47d");
+    } else if (deadlineDate < today) {
+      deadlineStatusCell.setValue("⛔ Overdue").setBackground("#f4cccc");
+    } else if (deadlineDate.getTime() === today.getTime()) {
+      deadlineStatusCell.setValue("⚠ Due Today").setBackground("#ffe599");
+    } else {
+      deadlineStatusCell.setValue("⏳ On Track").setBackground("#cfe2f3");
+    }
+  } else {
+    deadlineStatusCell.clearContent().setBackground(null);
+  }
+}
+
+// ✅ Manual email alert button
+function sendEmailAlerts() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  const colSubtask = headers.findIndex(h => h.toLowerCase().includes("subtask")) + 1;
+  const colAssignedTo = headers.findIndex(h => h.toLowerCase().includes("assigned to")) + 1;
+  const colDeadline = headers.findIndex(h => h.toLowerCase().includes("deadline")) + 1;
+  const colStatus = headers.findIndex(h => h.toLowerCase().includes("status")) + 1;
+
+  // ✅ Email mapping from config (K = name, L = email)
+  const mapping = sheet.getRange("K2:L").getValues().filter(r => r[0] && r[1]);
+  const emailMap = {};
+  mapping.forEach(r => emailMap[r[0].trim().toLowerCase()] = r[1].trim());
+
+  const data = sheet.getDataRange().getValues();
+  let emailsSent = 0;
+
+  for (let i = 2; i < data.length; i++) {
+    const subtask = data[i][colSubtask - 1];
+    const assigned = data[i][colAssignedTo - 1];
+    const deadline = data[i][colDeadline - 1];
+    const status = data[i][colStatus - 1];
+
+    if (subtask && assigned && deadline && status.toLowerCase() !== "completed") {
+      const recipient = emailMap[assigned.trim().toLowerCase()] || "";
+      if (recipient) {
+        const subject = `Task Reminder: ${subtask}`;
+        const body = `Hello ${assigned},\n\nThis is a reminder for your task "${subtask}" which is due on ${deadline}.`;
+        MailApp.sendEmail(recipient, subject, body);
+        emailsSent++;
+      }
+    }
+  }
+
+  SpreadsheetApp.getUi().alert(`${emailsSent} email alerts have been sent.`);
+}
+
+// ✅ Set alert time
+function setAlertTime() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt("Set Alert Time", "Enter time in HH:mm (24h format)", ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() === ui.Button.OK) {
+    const time = response.getResponseText().trim();
+    if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(time)) {
+      ScriptApp.getProjectTriggers().forEach(trigger => {
+        if (trigger.getHandlerFunction() === "sendEmailAlerts") ScriptApp.deleteTrigger(trigger);
+      });
+      const [hour, minute] = time.split(":").map(Number);
+      ScriptApp.newTrigger("sendEmailAlerts").timeBased().atHour(hour).nearMinute(minute).everyDays(1).create();
+      ui.alert(`✅ Daily alerts scheduled at ${time}`);
+    } else {
+      ui.alert("❌ Invalid time format. Please enter in HH:mm (24h).");
+    }
+  }
+}
+function onNewSheet(e) {
+  const sheet = e.source.getActiveSheet();
+  const sheetName = sheet.getName();
+
+  // Skip if it's Geetha (main page)
+  if (sheetName === "Geetha") return;
+
+  const headers = [
+    "Project Number", "Subtask", "Assigned To", "Status",
+    "Deadline", "Completed At", "Comment", "Deadline Status",
+    "StatusList", "StatusColor", "AssignedList", "Emails"
+  ];
+
+  // Set headers if empty
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+
+  // ✅ Insert formulas that link back to Geetha
+  // StatusList (col I)
+  sheet.getRange("I2").setFormula('=FILTER(Geetha!I2:I, Geetha!I2:I<>"")');
+  // StatusColor (col J)
+  sheet.getRange("J2").setFormula('=FILTER(Geetha!J2:J, Geetha!J2:J<>"")');
+  // AssignedList (col K)
+  sheet.getRange("K2").setFormula('=FILTER(Geetha!K2:K, Geetha!K2:K<>"")');
+  // Emails (col L)
+  sheet.getRange("L2").setFormula('=FILTER(Geetha!L2:L, Geetha!L2:L<>"")');
+
+  SpreadsheetApp.getUi().alert(`✅ Setup complete for sheet: ${sheetName}`);
+}
+
+// Installable trigger needed: runs when new sheet created
+function installNewSheetTrigger() {
+  ScriptApp.newTrigger("onNewSheet")
+    .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
+    .onChange()
+    .create();
+}
